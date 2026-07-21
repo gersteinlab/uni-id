@@ -16,301 +16,448 @@
 # SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
 # ----------------------------------------------------------------------------
 # createDiff.py
-# Keyed, lossless replacement for ptools createDiff.
 #
-# Reads SAM records on stdin (samtools view <bam> | createDiff.py) and writes
-# one tab-separated diff record per read on stdout. Unlike stock ptools, this captures
-# the read's ALT bases explicitly, so substitutions round-trip on plain M-CIGAR reads
-# (stock ptools loses them — it reconstructs the reference base at every mismatch).
+# Reads an aligned BAM and writes the two private layers directly:
 #
-# Two record classes:
-#   S (simple)  : mapped, primary, CIGAR is only M/=/X, and an MD tag is present.
-#                 Substitutions are extracted as genomic (pos:ref>alt) so the partition
-#                 step can test them directly against allowed_loci.bed.gz with no offset
-#                 math. SEQ is NOT stored — it is rebuilt at reconstruction from the
-#                 reference plus these substitutions.
-#   C (complex) : everything else (indels, soft/hard clips, N, unmapped, secondary/
-#                 supplementary, missing MD). These are routed to MP unconditionally in
-#                 v1. The full original SEQ and QUAL are stored so they round-trip
-#                 without any indel-reconstruction logic (deferred to v2).
+#     BAM  ->  LP.diff  +  MP.diff
 #
-# Output columns (tab-separated; RESTORE is the final field and may itself contain tabs):
-#   0  QNAME
-#   1  FLAG
-#   2  RNAME
-#   3  POS
-#   4  MAPQ
-#   5  CIGAR
-#   6  RNEXT
-#   7  PNEXT
-#   8  TLEN
-#   9  CLASS     S or C
-#   10 PAYLOAD   S: "pos:ref>alt;..." (or "." if the read matches reference)
-#                C: the raw original SEQ
-#   11 QUAL      C: raw original QUAL ; S: "." (QUAL is taken from the pBAM on rebuild)
-#   12+ RESTORE  the original optional tag columns (12.. of the SAM line), verbatim
+# Each record names its read by POSITION IN THE pBAM, not by a content key.
+# That is sound because pBAM line N is BAM line N: the sanitize transform
+# preserves QNAME, FLAG, RNAME, POS, MAPQ, RNEXT, PNEXT, TLEN and QUAL, and
+# alters only CIGAR. Measured on NA12878: chr20 (17,705,654 reads) and chr1
+# (63,275,059 reads), 100.0000% agreement on both read identity and POS.
 #
-# Columns 0-8 are the reconstruction key. They are invariant under the pBAM transform
-# for simple M reads (the LP-relevant case). Complex reads carry their full sequence so
-# they never depend on key-matching against an altered pBAM record.
+# Why not a content key. The previous format identified a read by columns
+# 0-8. Measured on the chr6 pBAM, that key has 52 duplicates, because
+# supplementary alignments of one chimeric read share QNAME, FLAG and all mate
+# fields by construction. Two reads sharing a key means one record serves both
+# and the other is restored from the wrong record. No subset of invariant
+# fields separates them, so the key cannot be repaired. A line number can
+# never collide.
+#
+# Why classification happens here. Routing needs RNAME, MAPQ and the read's
+# variants. Reading them from the BAM as it streams means they never have to be
+# stored, which removes RNAME, MAPQ and the whole 9-column key from the format,
+# and removes the intermediate whole-genome diff entirely.
+#
+# Output format (tab-separated). RESTORE is the trailing optional-tag columns.
+#
+#   S:  DELTA  S  subs                                RESTORE...
+#   C:  DELTA  C  CIGAR  variants  splices  forcemp   RESTORE...
+#   U:  DELTA  U  seq                                 RESTORE...
+#
+#   DELTA     pBAM lines advanced since the previous record IN THIS FILE. The
+#             first record carries the absolute line number. Delta rather than
+#             absolute because absolute numbers are ~9 digits and all differ,
+#             so they barely compress; gaps average ~4 and compress to ~1 byte.
+#   subs      "gpos:ref>alt;..." genomic coordinates, so the allowed list can
+#             be tested with no offset arithmetic.
+#   CIGAR     stored ONLY for C: it is the one field sanitize destroys.
+#   variants  "gpos:ref>alt;..." substitutions AND indels.
+#   splices   "off:I:bases;off:S:bases;..." inserted / soft-clipped bases.
+#   forcemp   "1" if the read must stay MP (soft clip / unanchorable indel).
+#   seq       raw SEQ, for reads that cannot be rebuilt from the reference.
+#
+# QNAME, FLAG, POS, RNEXT, PNEXT, TLEN and QUAL are not stored: all are
+# recovered from the pBAM at line N.
+#
+# Reference-only reads get no record at all, and there is no flag to change
+# that. The old --keep-ref-only put them in LP, which makes not-LP EXACTLY
+# equal to MP and hands an LP holder a perfect list of every read carrying a
+# rare variant. Dropping them is what makes the layering private.
+#
+# They are the ~71% of reads that
+# match the reference (548,094,823 of 768,580,569 in NA12878), and they
+# reconstruct by passing the pBAM line through untouched. This is also what
+# makes the layering private: an LP holder can tell which reads are NOT LP, but
+# that set is MP plus ref-only, and MP is only ~7.6% of it.
+#
+# Granularity is a property of invocation, not of the format. Whole BAM in ->
+# one pBAM, one LP/MP pair, global numbering. --region chr7 in -> the chr7
+# pBAM, a chr7 LP/MP pair, chr7-local numbering. Sanitize the same region with
+# the same flag and the pairing holds. Never mix a per-region diff with a
+# whole-genome pBAM.
+#
+# --allowed is optional. Without it the membership set is empty, so no
+# difference is non-characterizing and every variant-bearing read goes to MP.
+# That is the fail-closed reading of the layers rather than a degenerate case,
+# and it avoids loading ~13 GB of allowed list for input that cannot use it.
+#
+# Requires: Python 3 standard library, complex_variants.py alongside this file,
+# and samtools on PATH when using --bam.
+# ----------------------------------------------------------------------------
 
-import sys
+import argparse
+import bisect
+import gzip
 import os
 import re
-import argparse
 import subprocess
-import tempfile
+import sys
+
 import complex_variants as cv
 
 CIGAR_RE = re.compile(r'(\d+)([MIDNSHP=X])')
+SIMPLE_CIGAR_RE = re.compile(r'^[0-9MX=]+$')
 
-# SAM FLAG bits
 F_UNMAPPED = 0x4
 F_SECONDARY = 0x100
 F_SUPPLEMENTARY = 0x800
 
-
-def cigar_ops(cigar):
-    """Return list of (length, op) tuples; [] if cigar is '*' or malformed."""
-    if cigar == "*" or cigar == "":
-        return []
-    return [(int(n), op) for n, op in CIGAR_RE.findall(cigar)]
+MASK = (1 << 64) - 1
+_PRIMARY = set(["chr%d" % i for i in range(1, 23)] + ["chrX", "chrY"])
 
 
-def cigar_is_simple(ops):
-    """True iff every op is an aligned-match op (M/=/X) — no indels, clips, skips."""
-    return len(ops) > 0 and all(op in ("M", "=", "X") for _, op in ops)
+# ---------------------------------------------------------------------------
+# membership set
+# ---------------------------------------------------------------------------
+
+def _fnv(chrom, pos, ref, alt):
+    """FNV-1a over the joined key. Deterministic across runs, unlike Python's
+    salted hash() on str."""
+    b = ("%s:%s:%s:%s" % (chrom, pos, ref, alt)).encode()
+    x = 0xcbf29ce484222325
+    for c in b:
+        x ^= c
+        x = (x * 0x100000001b3) & MASK
+    return x
 
 
-def find_md(tags):
-    """Return the MD value (string after 'MD:Z:') or None."""
-    for t in tags:
+def open_maybe_gz(path, mode="rt"):
+    return gzip.open(path, mode) if path.endswith(".gz") else open(path, mode)
+
+
+def load_allowed(paths):
+    """5-column BEDs (CHROM START0 END REF ALT) -> set of 64-bit hashes keyed on
+    (chrom, END, ref, alt). END is the 1-based position, matching the payload's
+    coordinates. Hashed rather than stored as strings: the union of the allowed
+    list and the error set runs to ~2e8 alleles, which is ~22 GB as strings and
+    ~7 GB as hashes."""
+    allowed = set()
+    for path in paths:
+        if not path:
+            continue
+        with open_maybe_gz(path) as fh:
+            for line in fh:
+                if not line or line[0] == "#":
+                    continue
+                c = line.rstrip("\n").split("\t")
+                if len(c) < 5:
+                    continue
+                allowed.add(_fnv(c[0], c[2], c[3], c[4]))
+    return allowed
+
+
+def load_blacklist(path):
+    """{chrom: (starts[], ends[])}, sorted, for membership via bisect.
+    BED is 0-based half-open."""
+    if not path:
+        return None
+    iv = {}
+    with open_maybe_gz(path) as fh:
+        for line in fh:
+            if not line or line[0] == "#":
+                continue
+            c = line.rstrip("\n").split("\t")
+            if len(c) < 3:
+                continue
+            iv.setdefault(c[0], []).append((int(c[1]), int(c[2])))
+    bl = {}
+    for chrom, lst in iv.items():
+        lst.sort()
+        bl[chrom] = ([a for a, _ in lst], [b for _, b in lst])
+    return bl
+
+
+def in_blacklist(bl, chrom, pos1):
+    """pos1 is 1-based; BED is 0-based half-open."""
+    if bl is None or chrom not in bl:
+        return False
+    starts, ends = bl[chrom]
+    pos0 = pos1 - 1
+    i = bisect.bisect_right(starts, pos0) - 1
+    return i >= 0 and pos0 < ends[i]
+
+
+def is_primary(chrom):
+    return chrom in _PRIMARY
+
+
+# ---------------------------------------------------------------------------
+# substitution extraction
+# ---------------------------------------------------------------------------
+
+def parse_md(md):
+    out = []
+    i = 0
+    n = len(md)
+    while i < n:
+        if md[i].isdigit():
+            j = i
+            while j < n and md[j].isdigit():
+                j += 1
+            out.append(("m", int(md[i:j])))
+            i = j
+        elif md[i] == "^":
+            j = i + 1
+            while j < n and md[j].isalpha():
+                j += 1
+            out.append(("d", md[i + 1:j]))
+            i = j
+        else:
+            out.append(("x", md[i]))
+            i += 1
+    return out
+
+
+def extract_subs(pos, seq, qual, md, min_bq):
+    """Substitutions as (genomic_pos, ref_base, alt_base) for an M-only read.
+
+    A mismatch whose read base is below min_bq is treated as a sequencing error
+    and NOT recorded, so the read reconstructs as reference there. min_bq=0
+    disables this; the v3 pipeline runs at 0 and identifies errors downstream
+    by allele fraction, which base quality cannot do."""
+    have_qual = qual != "*" and len(qual) == len(seq)
+    subs = []
+    ref_pos = pos
+    read_idx = 0
+    for kind, val in parse_md(md):
+        if kind == "m":
+            ref_pos += val
+            read_idx += val
+        elif kind == "d":
+            ref_pos += len(val)
+        else:
+            if read_idx < len(seq):
+                if not (min_bq > 0 and have_qual
+                        and (ord(qual[read_idx]) - 33) < min_bq):
+                    subs.append((ref_pos, val, seq[read_idx]))
+            ref_pos += 1
+            read_idx += 1
+    return subs
+
+
+def get_md(fields):
+    for t in fields[11:]:
         if t.startswith("MD:Z:"):
             return t[5:]
     return None
 
 
-# MD tokens: a run-length integer, a deletion (^ + bases), or a single mismatch ref base
-MD_RE = re.compile(r'(\d+)|(\^[A-Za-z]+)|([A-Za-z])')
+# ---------------------------------------------------------------------------
+# classify + route
+# ---------------------------------------------------------------------------
 
+def classify(fields, min_bq):
+    """-> (cls, payload_cols, variants) where variants is a list of
+    (pos, ref, alt) used for routing. cls None means reference-only."""
+    flag = int(fields[1])
+    cigar = fields[5]
+    seq = fields[9]
+    qual = fields[10]
 
-def extract_subs(pos, seq, qual, md, min_bq):
-    """
-    Walk an MD string over a pure M/=/X read and return a list of
-    (genomic_pos, ref_base, alt_base) substitutions, or None if the walk is
-    inconsistent (caller then treats the read as complex).
+    # Only AS is carried. This matches the previous format and is not an
+    # oversight: pbam2bam emits recomputed MD/NM, the stored AS, and RG from
+    # the header, and discards everything else. Storing the full tag set costs
+    # ~100 bytes per record that nothing ever reads -- measured on chr2, that
+    # was 210 B/record against 107 for the old format.
+    #
+    # The consequence is a real one and belongs in Methods: tags other than
+    # MD/NM/AS/RG do NOT survive a round trip. "Recovers the original file
+    # exactly" is true of the core fields and QUAL, not of the tag set.
+    restore = []
+    for t in fields[11:]:
+        if t.startswith("AS:"):
+            restore = [t]
+            break
+    mapped = not (flag & F_UNMAPPED)
+    md = get_md(fields)
 
-    Valid only when CIGAR has no I/D/S/H/N: read index and reference index advance
-    together, so an MD match-run of n advances both by n, and an MD mismatch base
-    consumes one base of each. A '^' deletion token means the CIGAR was not actually
-    simple (inconsistent input) -> bail to complex.
+    # S: mapped, primary, M-only CIGAR, MD present. Substitutions are stored;
+    # SEQ is not, since it rebuilds from the reference plus the substitutions.
+    if (mapped and md is not None and seq != "*"
+            and not (flag & (F_SECONDARY | F_SUPPLEMENTARY))
+            and SIMPLE_CIGAR_RE.match(cigar)):
+        subs = extract_subs(int(fields[3]), seq, qual, md, min_bq)
+        if not subs:
+            return None, None, None            # reference-only: no record
+        sfield = ";".join("%d:%s>%s" % (p, r, a) for p, r, a in subs)
+        return "S", ["S", sfield] + restore, subs
 
-    Base-quality filter: a mismatch whose read-base Phred quality is below min_bq is
-    treated as NOT a confirmed variant and is skipped (the position is left as
-    reference). This drops sequencing errors, which present as low-quality singleton
-    mismatches, so they do not route an otherwise-common read to MP. min_bq <= 0
-    disables the filter. QUAL '*' (absent) disables it for that read.
-    """
-    have_qual = qual != "*" and len(qual) == len(seq)
-    read_idx = 0
-    ref_pos = pos  # 1-based genomic position of the next aligned base
-    subs = []
-    for num, deletion, base in MD_RE.findall(md):
-        if num:
-            n = int(num)
-            read_idx += n
-            ref_pos += n
-        elif deletion:
-            return None  # deletion in MD but CIGAR was simple: inconsistent
-        elif base:
-            if read_idx >= len(seq):
-                return None  # ran off the read: inconsistent
-            # skip low-quality mismatches: treat as reference, not a variant
-            if min_bq > 0 and have_qual and (ord(qual[read_idx]) - 33) < min_bq:
-                read_idx += 1
-                ref_pos += 1
-                continue
-            alt = seq[read_idx]
-            subs.append((ref_pos, base.upper(), alt.upper()))
-            read_idx += 1
-            ref_pos += 1
-    if read_idx != len(seq):
-        return None  # MD did not span the whole read: inconsistent
-    return subs
-
-
-def is_simple_fields(f, min_bq):
-    """True iff this SAM record is a primary, mapped, pure-M read with MD and real SEQ
-    AND its substitutions extract cleanly. Mirrors make_record's 'simple' decision so the
-    collision pre-pass and the emit pass agree on which reads are simple."""
-    flag = int(f[1])
-    rname = f[2]
-    seq = f[9]
-    if flag & (F_SECONDARY | F_SUPPLEMENTARY):
-        return False
-    if (flag & F_UNMAPPED) or rname == "*":
-        return False
-    if seq == "*":
-        return False
-    if not cigar_is_simple(cigar_ops(f[5])):
-        return False
-    md = find_md(f[11:])
-    if md is None:
-        return False
-    return extract_subs(int(f[3]), seq, f[10], md, min_bq) is not None
-
-
-def position_key(f):
-    """The 8-field key minus QNAME: FLAG,RNAME,POS,MAPQ,CIGAR,RNEXT,PNEXT,TLEN.
-    Invariant under the pBAM transform for simple reads, so it identifies a simple read's
-    pBAM image without storing QNAME (recovered from the matched pBAM read)."""
-    return "\t".join(f[1:9])
-
-
-def compute_collisions(bam, min_bq, tmpdir):
-    """
-    One streaming pass over the BAM: emit the position-key of every simple read to a temp
-    file, then sort|uniq -d (disk-backed, memory bounded) to find position-keys shared by
-    two or more simple reads. Those reads must keep QNAME (cannot be disambiguated by
-    position alone). Returns a set of colliding position-key strings.
-    """
-    keyfile = tempfile.NamedTemporaryFile(mode="w", dir=tmpdir, prefix="poskeys.",
-                                          suffix=".tsv", delete=False)
-    try:
-        view = subprocess.Popen(["samtools", "view", bam], stdout=subprocess.PIPE, text=True)
-        n_simple = 0
-        for line in view.stdout:
-            f = line.rstrip("\n").split("\t")
-            if is_simple_fields(f, min_bq):
-                keyfile.write(position_key(f) + "\n")
-                n_simple += 1
-        view.stdout.close()
-        view.wait()
-        keyfile.close()
-
-        collisions = set()
-        # sort | uniq -d  via subprocess; read the duplicate keys back
-        sort = subprocess.Popen(["sort", keyfile.name], stdout=subprocess.PIPE, text=True,
-                                env=dict(os.environ, LC_ALL="C"))
-        uniq = subprocess.Popen(["uniq", "-d"], stdin=sort.stdout, stdout=subprocess.PIPE,
-                                text=True)
-        sort.stdout.close()
-        for line in uniq.stdout:
-            collisions.add(line.rstrip("\n"))
-        uniq.wait()
-        sort.wait()
-        sys.stderr.write("collision pre-pass: %d simple reads, %d colliding position-keys "
-                         "(those reads keep QNAME)\n" % (n_simple, len(collisions)))
-        return collisions
-    finally:
-        try:
-            os.unlink(keyfile.name)
-        except OSError:
-            pass
-
-
-def make_record(line, min_bq, collisions=None):
-    line = line.rstrip("\n")
-    f = line.split("\t")
-    qname, flag_s, rname, pos_s, mapq, cigar, rnext, pnext, tlen = f[:9]
-    seq = f[9]
-    qual = f[10]
-    tags = f[11:]
-    flag = int(flag_s)
-
-    key = [qname, flag_s, rname, pos_s, mapq, cigar, rnext, pnext, tlen]
-    # v2: store only AS (genuinely unrecomputable). MD/NM are recomputed at reconstruction;
-    # RG is re-stamped from the header; all other tags (PG, MQ, XS, MC, SA, XA, ...) are
-    # dropped. This is the bulk of the v2 size win and is lossy on those tags by design.
-    as_tag = next((t for t in tags if t.startswith("AS:")), None)
-    restore = [as_tag] if as_tag else []
-
-    # Decide class. Anything not cleanly a primary, mapped, pure-M read with an MD tag
-    # and a real sequence is complex -> store raw SEQ/QUAL, route to MP.
-    is_primary = not (flag & (F_SECONDARY | F_SUPPLEMENTARY))
-    is_mapped = not (flag & F_UNMAPPED) and rname != "*"
-    ops = cigar_ops(cigar)
-    md = find_md(tags)
-
-    simple = (
-        is_primary
-        and is_mapped
-        and seq != "*"
-        and cigar_is_simple(ops)
-        and md is not None
-    )
-
-    if simple:
-        subs = extract_subs(int(pos_s), seq, qual, md, min_bq)
-        if subs is not None:
-            payload = ";".join("%d:%s>%s" % (p, r, a) for p, r, a in subs) if subs else "."
-            # QNAME-drop: if collisions is provided and this read's position-key is unique,
-            # store class 'S' with QNAME blanked ('.'); reconstruction recovers QNAME from
-            # the uniquely-matching pBAM read. If the position-key collides, or we have no
-            # collision info (stdin mode), keep QNAME with class 'Sq'.
-            if collisions is not None and position_key(f) not in collisions:
-                return "\t".join(["."] + key[1:] + ["S", payload, "."] + restore)
-            return "\t".join(key + ["Sq", payload, "."] + restore)
-        # extraction was inconsistent: fall through to complex
-
-    # complex. Two sub-cases:
-    #   C (structured): mapped, has MD, real SEQ. Extract the full variant set (subs +
-    #     indels) for classification and reconstruction. SEQ is NOT stored (rebuilt from
-    #     reference at reconstruction); QUAL is NOT stored (recovered from the pBAM image).
-    #       col 10  variants : "gpos:ref>alt;..." (subs AND indels; SNVs are ref/alt len 1)
-    #       col 11  splices  : "offset:I:bases;offset:S:bases;..." (inserted/clipped bases)
-    #       col 12  forcemp  : "1" if the read must stay MP (soft clip / unanchorable indel)
-    #       col 13+ AS
-    #   U (raw): unmapped or missing MD -- cannot rebuild from reference, so store raw SEQ
-    #     (QUAL still recovered from the pBAM). col 10 = SEQ, col 11 = ".".
-    if is_mapped and md is not None and seq != "*":
-        ex = cv.extract(int(pos_s), cigar, seq, md, qual, min_bq)
+    # C: mapped with MD and real SEQ. Full edit set; SEQ and QUAL both omitted.
+    # CIGAR IS stored: sanitize alters it, and it is the only such field.
+    if mapped and md is not None and seq != "*":
+        ex = cv.extract(int(fields[3]), cigar, seq, md, qual, min_bq)
         variants = ex["subs"] + ex["indels"]
-        vfield = ";".join("%d:%s>%s" % (p, r, a) for p, r, a in variants) if variants else "."
-        splices = [("%d:I:%s" % (o, b)) for o, b in ex["inserts"]] + \
-                  [("%d:S:%s" % (o, b)) for o, b in ex["clips"]]
+        vfield = ";".join("%d:%s>%s" % (p, r, a) for p, r, a in variants) \
+            if variants else "."
+        splices = ["%d:I:%s" % (o, b) for o, b in ex["inserts"]] + \
+                  ["%d:S:%s" % (o, b) for o, b in ex["clips"]]
         sfield = ";".join(splices) if splices else "."
         fmp = "1" if ex["force_mp"] else "0"
-        return "\t".join(key + ["C", vfield, sfield, fmp] + restore)
+        return "C", ["C", cigar, vfield, sfield, fmp] + restore, variants
 
-    # U: raw fallback (unmapped / no MD)
-    return "\t".join(key + ["U", seq, "."] + restore)
+    # U: unmapped or no MD. Cannot rebuild from the reference, so store SEQ.
+    return "U", ["U", seq] + restore, None
 
+
+def route(cls, fields, variants, forcemp, allowed, bl, args):
+    """-> True for MP, False for LP. Fail-closed: MP unless every difference is
+    shown to be non-characterizing.
+
+    Order matters and matches the previous implementation: the whole-read
+    escapes are tested BEFORE forcemp, so a low-MAPQ or non-primary complex read
+    goes to LP even when forcemp is set. Testing forcemp first would send it to
+    MP instead, which is a different partition."""
+    if cls == "U":
+        return True                                   # unmapped: always MP
+
+    chrom = fields[2]
+    mapq = int(fields[4]) if fields[4].isdigit() else 0
+
+    # Whole-read escapes. A read on a decoy/alt contig is not primary-assembly
+    # genotype, and a read below the MAPQ floor is not confidently placed, so
+    # neither carries characterizing information.
+    if args.primary_chroms_only and not is_primary(chrom):
+        return False
+    if args.min_mapq > 0 and mapq < args.min_mapq:
+        return False
+
+    if forcemp:
+        return True                    # soft clip / unanchorable indel
+
+    for pos, ref, alt in (variants or []):
+        if alt == "N":
+            continue                                  # no-call: no genotype
+        if _fnv(chrom, pos, ref, alt) in allowed:
+            continue                                  # common, or a known error
+        if in_blacklist(bl, chrom, int(pos)):
+            continue                                  # unmappable region
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Keyed, lossless createDiff with base-quality mismatch filtering and "
-                    "QNAME-drop. With --bam it does a two-pass run (collision pre-pass + "
-                    "emit) so simple reads with a unique position-key can drop QNAME. "
-                    "Without --bam it reads SAM on stdin and keeps QNAME on every record."
-    )
-    ap.add_argument("--bam", help="input BAM/CRAM path; enables QNAME-drop (two-pass).")
-    ap.add_argument("--min-bq", type=int, default=20,
-                    help="Phred base-quality floor for calling a mismatch a substitution. "
-                         "Mismatches below this are treated as reference. 0 disables. Default: 20")
-    ap.add_argument("--tmpdir", default=".",
-                    help="directory for the collision-sort temp file (default: current dir).")
+        prog="createDiff.py",
+        description="Read a BAM and write the LP and MP layers, with records "
+                    "keyed by pBAM line number.")
+    src = ap.add_argument_group("input")
+    src.add_argument("--bam", default=None,
+                     help="input BAM (needs samtools). Default: SAM on stdin.")
+    src.add_argument("--region", default=None,
+                     help="restrict to a region, e.g. chr7. Line numbers then "
+                          "run within the region; sanitize the SAME region so "
+                          "the pBAM pairs with it.")
+    src.add_argument("--min-bq", type=int, default=0,
+                     help="Phred floor for calling a mismatch a substitution "
+                          "(default 0 = off; errors are handled downstream by "
+                          "allele fraction)")
+
+    rt = ap.add_argument_group("routing")
+    rt.add_argument("--allowed", default=None,
+                    help="allowed-list BED(.gz): CHROM START0 END REF ALT. "
+                         "Optional: without it nothing is non-characterizing, so "
+                         "every variant-bearing read goes to MP. That is the "
+                         "fail-closed default, and it skips a ~13 GB load for "
+                         "input that cannot use it (e.g. unmapped-only streams, "
+                         "where class U routes to MP without consulting the set).")
+    rt.add_argument("--errset", default=None,
+                    help="error-site BED(.gz); unioned with --allowed")
+    rt.add_argument("--blacklist", default=None,
+                    help="problem-region BED(.gz); substitutions inside never force MP")
+    rt.add_argument("--min-mapq", type=int, default=0,
+                    help="reads below this MAPQ do not force MP (0 = off)")
+    rt.add_argument("--primary-chroms-only", action="store_true",
+                    help="reads off chr1-22,X,Y do not force MP")
+
+    out = ap.add_argument_group("output")
+    out.add_argument("--out-prefix", required=True,
+                     help="writes <prefix>.LP.diff and <prefix>.MP.diff")
+    out.add_argument("--gzip", action="store_true")
     args = ap.parse_args()
 
-    out = sys.stdout
-    out.write("#QNAME\tFLAG\tRNAME\tPOS\tMAPQ\tCIGAR\tRNEXT\tPNEXT\tTLEN\tCLASS\tPAYLOAD\tQUAL\tRESTORE...\n")
+    if args.allowed or args.errset:
+        sys.stderr.write("loading membership set...\n")
+        allowed = load_allowed([args.allowed, args.errset])
+        sys.stderr.write("  alleles: %d\n" % len(allowed))
+    else:
+        allowed = set()
+        sys.stderr.write("no --allowed/--errset: every variant-bearing read -> MP\n")
+    bl = load_blacklist(args.blacklist)
+    if bl is not None:
+        sys.stderr.write("  blacklist chroms: %d\n" % len(bl))
 
     if args.bam:
-        collisions = compute_collisions(args.bam, args.min_bq, args.tmpdir)
-        view = subprocess.Popen(["samtools", "view", args.bam], stdout=subprocess.PIPE, text=True)
-        for line in view.stdout:
-            if not line or line[0] == "@":
-                continue
-            out.write(make_record(line, args.min_bq, collisions) + "\n")
-        view.stdout.close()
-        view.wait()
+        cmd = ["samtools", "view", args.bam]
+        if args.region:
+            cmd.append(args.region)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
+        stream = proc.stdout
     else:
-        # stdin filter mode: no collision info, QNAME kept on every record
-        for line in sys.stdin:
-            if not line or line[0] == "@":
+        if args.region:
+            sys.stderr.write("--region requires --bam\n")
+            return 1
+        proc = None
+        stream = sys.stdin
+
+    suffix = ".gz" if args.gzip else ""
+    opener = (lambda p: gzip.open(p, "wt")) if args.gzip else (lambda p: open(p, "wt"))
+    lp_path = args.out_prefix + ".LP.diff" + suffix
+    mp_path = args.out_prefix + ".MP.diff" + suffix
+
+    lineno = 0
+    last = {"LP": 0, "MP": 0}
+    n = {"LP": 0, "MP": 0, "ref": 0}
+    ncls = {"S": 0, "C": 0, "U": 0}
+
+    with opener(lp_path) as lp, opener(mp_path) as mp:
+        handle = {"LP": lp, "MP": mp}
+        for line in stream:
+            if line[0] == "@":
                 continue
-            out.write(make_record(line, args.min_bq, None) + "\n")
+            lineno += 1                       # 1-based, matches the pBAM line
+            f = line.rstrip("\n").split("\t")
+            if len(f) < 11:
+                continue
+
+            cls, cols, variants = classify(f, args.min_bq)
+            if cls is None:
+                n["ref"] += 1                 # reference-only: no record
+                continue
+            ncls[cls] += 1
+
+            # C payload is ["C", cigar, variants, splices, forcemp], so cols[4]
+            forcemp = (cls == "C" and cols[4] == "1")
+            layer = "MP" if route(cls, f, variants, forcemp, allowed, bl, args) \
+                    else "LP"
+
+            # delta is per-file: the gap since the last record in THIS layer
+            handle[layer].write("%d\t%s\n" % (lineno - last[layer],
+                                              "\t".join(cols)))
+            last[layer] = lineno
+            n[layer] += 1
+
+    if proc is not None:
+        proc.stdout.close()
+        proc.wait()
+
+    sys.stderr.write(
+        "done.\n"
+        "  reads seen:    %d\n"
+        "  reference-only: %d  (no record; reconstructed from the pBAM)\n"
+        "  LP records:    %d\n"
+        "  MP records:    %d\n"
+        "  classes: S=%d C=%d U=%d\n"
+        % (lineno, n["ref"], n["LP"], n["MP"], ncls["S"], ncls["C"], ncls["U"]))
+    if lineno != n["ref"] + n["LP"] + n["MP"]:
+        sys.stderr.write("  WARNING: reads seen != ref + LP + MP. Every read must\n"
+                         "  land in exactly one bucket.\n")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

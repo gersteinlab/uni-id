@@ -53,43 +53,13 @@
 
 import sys
 import re
+import gzip
 import argparse
 import complex_variants as cv
 
 CIGAR_RE = re.compile(r'(\d+)([MIDNSHP=X])')
 NKEY = 9  # columns 0..8 are the reconstruction key
 
-
-def load_layers(paths):
-    """
-    Read the diff layer files. Returns:
-      simple_pk : dict position_key_tuple(f[1:9]) -> (payload, restore)   [class S, QNAME dropped]
-      simple_fk : dict full_key_tuple(f[0:9])      -> (payload, restore)   [class Sq, QNAME kept]
-      complex   : list of full C/U field-lists (emitted directly)
-      csuppress : set of (QNAME, FLAG) for held complex reads (suppress their pBAM images)
-      cqual_needed : invariant keys (QNAME,FLAG,RNEXT,PNEXT,TLEN) of complex reads
-    """
-    simple_pk = {}
-    simple_fk = {}
-    complex_records = []
-    csuppress = set()
-    cqual_needed = set()
-    for path in paths:
-        with open(path, "rt") as fh:
-            for line in fh:
-                if not line or line[0] == "#":
-                    continue
-                f = line.rstrip("\n").split("\t")
-                cls = f[9]
-                if cls == "S":          # QNAME dropped: key by position (f[1:9])
-                    simple_pk[tuple(f[1:NKEY])] = (f[10], f[12:])
-                elif cls == "Sq":       # QNAME kept: key by full 9-tuple
-                    simple_fk[tuple(f[:NKEY])] = (f[10], f[12:])
-                else:                   # C or U
-                    complex_records.append(f)
-                    csuppress.add((f[0], f[1]))
-                    cqual_needed.add((f[0], f[1], f[6], f[7], f[8]))
-    return simple_pk, simple_fk, complex_records, csuppress, cqual_needed
 
 
 def apply_subs(ref_seq, pos, payload):
@@ -110,29 +80,6 @@ def apply_subs(ref_seq, pos, payload):
     return "".join(seq)
 
 
-def rebuild_simple(pbam_fields, qname, rest8, payload, restore, rg_tag):
-    """
-    Rebuild a simple read's SAM line. qname is supplied separately (recovered from the
-    pBAM read for class-S records, or the stored QNAME for class-Sq). rest8 is the other
-    eight key fields (FLAG,RNAME,POS,MAPQ,CIGAR,RNEXT,PNEXT,TLEN). SEQ is the pBAM
-    reference sequence with ALT bases written back; QUAL comes from the pBAM read; MD/NM
-    are recomputed; tags are the restored originals.
-    """
-    flag, rname, pos_s, mapq, cigar, rnext, pnext, tlen = rest8
-    ref_seq = pbam_fields[9]
-    qual = pbam_fields[10]
-    seq = apply_subs(ref_seq, int(pos_s), payload)
-    md_tag, nm_tag = build_md_nm(payload, int(pos_s), len(seq))
-    out = [qname, flag, rname, pos_s, mapq, cigar, rnext, pnext, tlen, seq, qual]
-    out.append(md_tag)
-    out.append(nm_tag)
-    as_tag = as_from_restore(restore)
-    if as_tag:
-        out.append(as_tag)
-    if rg_tag:
-        out.append(rg_tag)
-    return "\t".join(out)
-
 
 def parse_splices(sfield):
     """'offset:I:bases;offset:S:bases' -> (inserts list, clips list) of (offset, bases)."""
@@ -148,50 +95,6 @@ def parse_splices(sfield):
             clips.append((off, bases))
     return inserts, clips
 
-
-def emit_complex(fields, qual, rg_tag, ref_lookup):
-    """
-    Emit a complex read with recovered QUAL and re-stamped RG.
-
-    Class 'C' (structured): rebuild SEQ from reference + stored variants/splices.
-      layout: 0..8 key, 9 'C', 10 variants(subs+indels), 11 splices, 12 forcemp, 13.. tags
-    Class 'U' (raw): unmapped / no-MD; SEQ stored verbatim.
-      layout: 0..8 key, 9 'U', 10 SEQ, 11 '.', 12.. tags
-
-    QUAL is recovered from the pBAM image (col passed in). MD/NM are omitted for complex
-    reads (acceptable lossy-tag policy). AS is restored if present.
-    """
-    cls = fields[9]
-    key = fields[:NKEY]
-
-    if cls == "U":
-        seq = fields[10]
-        tags = fields[12:]
-    else:  # 'C'
-        chrom = fields[2]
-        pos = int(fields[3])
-        cigar = fields[5]
-        variants_field = fields[10]
-        inserts, clips = parse_splices(fields[11])
-        # SNV subs for M-position overwrite: entries with single-base ref AND alt
-        subs = []
-        if variants_field != ".":
-            for it in variants_field.split(";"):
-                loc, ra = it.split(":")
-                ref, alt = ra.split(">")
-                if len(ref) == 1 and len(alt) == 1:
-                    subs.append((int(loc), ref, alt))
-        ex = {"subs": subs, "inserts": inserts, "clips": clips}
-        seq = cv.rebuild_seq(pos, cigar, ref_lookup, chrom, ex)
-        tags = fields[13:]
-
-    out = key + [seq, qual]
-    as_tag = as_from_restore(tags)
-    if as_tag:
-        out.append(as_tag)
-    if rg_tag:
-        out.append(rg_tag)
-    return "\t".join(out)
 
 
 def build_md_nm(payload, pos, seqlen):
@@ -218,6 +121,7 @@ def build_md_nm(payload, pos, seqlen):
     return ("MD:Z:" + md, "NM:i:%d" % len(items))
 
 
+
 def parse_rg_id(header_line):
     """Extract the RG ID from an @RG header line, or None."""
     if not header_line.startswith("@RG"):
@@ -236,113 +140,228 @@ def as_from_restore(restore):
     return None
 
 
+
+# ---------------------------------------------------------------------------
+# diff reader
+# ---------------------------------------------------------------------------
+
+def open_maybe_gz(path, mode="rt"):
+    return gzip.open(path, mode) if path.endswith(".gz") else open(path, mode)
+
+
+class DiffReader:
+    """Streams a delta-encoded diff, exposing the absolute pBAM line of the next
+    record. Records are read in order and never held: this is what makes the
+    restore O(1) in memory instead of the 105-158 GB the old dict needed for
+    175M LP records."""
+
+    def __init__(self, path):
+        self.fh = open_maybe_gz(path)
+        self.path = path
+        self.line = None      # absolute pBAM line of the pending record
+        self.rec = None       # record columns after the delta
+        self.n = 0
+        self._abs = 0
+        self.advance()
+
+    def advance(self):
+        for raw in self.fh:
+            if not raw or raw[0] == "#":
+                continue
+            f = raw.rstrip("\n").split("\t")
+            if len(f) < 2:
+                continue
+            self._abs += int(f[0])       # delta since this file's last record
+            self.line = self._abs
+            self.rec = f[1:]
+            self.n += 1
+            return
+        self.line = None
+        self.rec = None
+
+    def close(self):
+        self.fh.close()
+
+
+# ---------------------------------------------------------------------------
+# restore, one record class each
+# ---------------------------------------------------------------------------
+# Every one of these takes the pBAM read's fields for the parts sanitize
+# preserved (QNAME, FLAG, RNAME, POS, MAPQ, RNEXT, PNEXT, TLEN, QUAL) and the
+# diff record for the parts it did not.
+
+def restore_simple(pf, rec, rg_tag):
+    """rec = [S, subs, *tags]. The pBAM SEQ is the reference at this position,
+    so restoring is writing the ALT bases back into it."""
+    pos_s = pf[3]
+    payload = rec[1]
+    seq = apply_subs(pf[9], int(pos_s), payload)
+    md_tag, nm_tag = build_md_nm(payload, int(pos_s), len(seq))
+    out = pf[:9] + [seq, pf[10], md_tag, nm_tag]
+    as_tag = as_from_restore(rec[2:])
+    if as_tag:
+        out.append(as_tag)
+    if rg_tag:
+        out.append(rg_tag)
+    return "\t".join(out)
+
+
+def restore_complex(pf, rec, ref_lookup, rg_tag):
+    """rec = [C, cigar, variants, splices, forcemp, *tags].
+
+    CIGAR comes from the record: it is the only field sanitize alters, which is
+    measured (200/200 chr6 complex reads differ on CIGAR, 0/200 differ on
+    anything else). Everything else comes from the pBAM line."""
+    chrom = pf[2]
+    pos = int(pf[3])
+    cigar = rec[1]
+    inserts, clips = parse_splices(rec[3])
+    subs = []
+    if rec[2] != ".":
+        for it in rec[2].split(";"):
+            loc, ra = it.split(":")
+            ref, alt = ra.split(">")
+            if len(ref) == 1 and len(alt) == 1:   # SNVs only; indels ride the CIGAR
+                subs.append((int(loc), ref, alt))
+    ex = {"subs": subs, "inserts": inserts, "clips": clips}
+    seq = cv.rebuild_seq(pos, cigar, ref_lookup, chrom, ex)
+    key = list(pf[:9])
+    key[5] = cigar                                 # swap the sanitized CIGAR out
+    out = key + [seq, pf[10]]
+    as_tag = as_from_restore(rec[5:])
+    if as_tag:
+        out.append(as_tag)
+    if rg_tag:
+        out.append(rg_tag)
+    return "\t".join(out)
+
+
+def restore_unmapped(pf, rec, rg_tag):
+    """rec = [U, seq, *tags]. Not rebuildable from the reference, so SEQ was
+    stored verbatim. QUAL still comes from the pBAM."""
+    out = pf[:9] + [rec[1], pf[10]]
+    as_tag = as_from_restore(rec[2:])
+    if as_tag:
+        out.append(as_tag)
+    if rg_tag:
+        out.append(rg_tag)
+    return "\t".join(out)
+
+
+# ---------------------------------------------------------------------------
+
 def main():
-    ap = argparse.ArgumentParser(description="Reconstruct BAM from pBAM + keyed diff layers.")
+    ap = argparse.ArgumentParser(
+        prog="pbam2bam.py",
+        description="Restore a BAM from a pBAM plus one or more line-numbered "
+                    "diff layers. Reads pBAM SAM on stdin, writes SAM on stdout.")
     ap.add_argument("--diff", action="append", required=True,
-                    help="a diff layer file (.LP.diff and/or .MP.diff). Repeatable.")
-    ap.add_argument("--reference",
-                    help="reference FASTA, required if any 'C' (structured complex) records "
-                         "are present; their SEQ is rebuilt from it. 'U' (raw) and simple "
-                         "reads do not need it.")
+                    help="a layer (repeatable). pBAM+LP restores common variation; "
+                         "pBAM+LP+MP restores the original.")
+    ap.add_argument("--reference", default=None,
+                    help="reference FASTA. Required only if a supplied layer holds "
+                         "class-C records.")
     args = ap.parse_args()
 
-    simple_pk, simple_fk, complex_records, csuppress, cqual_needed = load_layers(args.diff)
-    sys.stderr.write("loaded: %d simple(QNAME-dropped) + %d simple(QNAME-kept), %d complex "
-                     "(suppress %d QNAME/FLAG)\n"
-                     % (len(simple_pk), len(simple_fk), len(complex_records), len(csuppress)))
+    readers = [DiffReader(p) for p in args.diff]
+    for r in readers:
+        sys.stderr.write("layer %s: first record at pBAM line %s\n"
+                         % (r.path, r.line))
 
-    # Load reference only if we actually have structured complex records to rebuild.
-    n_struct = sum(1 for fl in complex_records if fl[9] == "C")
     ref_lookup = None
-    if n_struct > 0:
-        if not args.reference:
-            sys.stderr.write("ERROR: %d structured complex (C) records require --reference\n"
-                             % n_struct)
-            sys.exit(2)
-        sys.stderr.write("loading reference %s for %d complex reads...\n"
-                         % (args.reference, n_struct))
+    if args.reference:
+        sys.stderr.write("loading reference %s...\n" % args.reference)
         _ref = {}
         _name, _parts = None, []
-        with open(args.reference) as fh:
-            for line in fh:
-                if line.startswith(">"):
+        opener = gzip.open if args.reference.endswith(".gz") else open
+        with opener(args.reference, "rt") as fh:
+            for l in fh:
+                if l.startswith(">"):
                     if _name is not None:
                         _ref[_name] = "".join(_parts)
-                    _name = line[1:].split()[0]
+                    _name = l[1:].split()[0]
                     _parts = []
                 else:
-                    _parts.append(line.strip())
+                    _parts.append(l.strip())
         if _name is not None:
             _ref[_name] = "".join(_parts)
+        sys.stderr.write("  contigs: %d\n" % len(_ref))
 
         def ref_lookup(chrom, start0, length):
             return _ref[chrom][start0:start0 + length]
 
-    out = sys.stdout
-    n_hit = n_miss = n_suppressed = 0
-    rg_tag = None  # first @RG ID seen in the pBAM header, re-stamped on every read
-    complex_qual = {}  # invariant key -> QUAL, harvested from the pBAM stream
+    n_restored = n_through = 0
+    n_cls = {"S": 0, "C": 0, "U": 0}
+    lineno = 0
+    rg_tag = None      # first @RG ID in the pBAM header, re-stamped on every read
 
     for line in sys.stdin:
         if line[0] == "@":
-            out.write(line)  # pass through SAM header
+            sys.stdout.write(line)
             if rg_tag is None:
                 rg_id = parse_rg_id(line)
                 if rg_id is not None:
                     rg_tag = "RG:Z:" + rg_id
             continue
-        f = line.rstrip("\n").split("\t")
 
-        # harvest QUAL for complex reads BEFORE any branch: the pBAM image of a complex
-        # read is the one that gets suppressed, so grab its (verbatim) QUAL now.
-        inv = (f[0], f[1], f[6], f[7], f[8])
-        if inv in cqual_needed:
-            complex_qual[inv] = f[10]
+        lineno += 1
+        pf = line.rstrip("\n").split("\t")
 
-        # Suppress complex images FIRST, before the simple lookups. A complex read's pBAM
-        # image has an altered position-key that could coincidentally collide with a real
-        # simple read's position-key; checking (QNAME,FLAG) suppression first prevents it
-        # from being mis-reconstructed as a simple read.
-        if (f[0], f[1]) in csuppress:
-            n_suppressed += 1
+        # Records are disjoint across layers by construction, so at most one
+        # reader can be pending at this line. No key, so no collision is
+        # representable: this is the whole point of the format.
+        hit = None
+        for r in readers:
+            if r.line == lineno:
+                hit = r
+                break
+
+        if hit is None:
+            sys.stdout.write(line)          # reference-only: pass through
+            n_through += 1
             continue
 
-        # Sq (QNAME kept): match by full 9-key.
-        rec = simple_fk.get(tuple(f[:NKEY]))
-        if rec is not None:
-            payload, restore = rec
-            out.write(rebuild_simple(f, f[0], f[1:NKEY], payload, restore, rg_tag) + "\n")
-            n_hit += 1
-            continue
+        rec = hit.rec
+        hit.advance()
+        cls = rec[0]
+        n_cls[cls] = n_cls.get(cls, 0) + 1
 
-        # S (QNAME dropped): match by position-key (f[1:9]); recover QNAME from this pBAM read.
-        rec = simple_pk.get(tuple(f[1:NKEY]))
-        if rec is not None:
-            payload, restore = rec
-            out.write(rebuild_simple(f, f[0], f[1:NKEY], payload, restore, rg_tag) + "\n")
-            n_hit += 1
-            continue
+        if cls == "S":
+            sys.stdout.write(restore_simple(pf, rec, rg_tag) + "\n")
+        elif cls == "U":
+            sys.stdout.write(restore_unmapped(pf, rec, rg_tag) + "\n")
+        else:
+            if ref_lookup is None:
+                sys.stderr.write("class-C record at line %d but no --reference\n"
+                                 % lineno)
+                return 1
+            sys.stdout.write(restore_complex(pf, rec, ref_lookup, rg_tag) + "\n")
+        n_restored += 1
 
-        out.write(line)  # present-but-sanitized pass-through
-        n_miss += 1
-
-    # emit held complex reads directly, recovering QUAL by invariant key
-    n_qual_missing = 0
-    for fields in complex_records:
-        inv = (fields[0], fields[1], fields[6], fields[7], fields[8])
-        qual = complex_qual.get(inv)
-        if qual is None:
-            qual = "*"  # no pBAM image matched; emit unknown QUAL rather than fail
-            n_qual_missing += 1
-        out.write(emit_complex(fields, qual, rg_tag, ref_lookup) + "\n")
+    # Every layer must be exhausted. A leftover record means it pointed past the
+    # end of the pBAM, i.e. the diff and the pBAM are not a matching pair --
+    # almost always a per-region diff run against the wrong region's pBAM.
+    rc = 0
+    for r in readers:
+        if r.line is not None:
+            sys.stderr.write("ERROR: %s has records past the end of the pBAM "
+                             "(next at line %d, pBAM has %d). The diff and pBAM "
+                             "are not a matching pair.\n" % (r.path, r.line, lineno))
+            rc = 1
+        r.close()
 
     sys.stderr.write(
-        "done. pBAM reads: %d restored, %d passed-through-sanitized, %d suppressed; "
-        "%d complex emitted from diff (%d with QUAL recovered, %d QUAL-missing).\n"
-        % (n_hit, n_miss, n_suppressed, len(complex_records),
-           len(complex_records) - n_qual_missing, n_qual_missing)
-    )
+        "done.\n"
+        "  pBAM lines:   %d\n"
+        "  restored:     %d  (S=%d C=%d U=%d)\n"
+        "  passed through: %d  (reference-only)\n"
+        % (lineno, n_restored, n_cls["S"], n_cls["C"], n_cls["U"], n_through))
+    if lineno != n_restored + n_through:
+        sys.stderr.write("  WARNING: lines != restored + passed. Every pBAM line "
+                         "must be emitted exactly once.\n")
+        rc = 1
+    return rc
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
