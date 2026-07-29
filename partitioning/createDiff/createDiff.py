@@ -123,6 +123,81 @@ def _fnv(chrom, pos, ref, alt):
     return x
 
 
+class RefFasta:
+    """Random access to a .fai-indexed FASTA, holding one contig at a time.
+
+    createDiff runs per contig and the BAM is coordinate-sorted, so one resident
+    contig suffices; the 'other'/'unplaced' buckets hold many small contigs,
+    which are cheap to swap. Reads the .fai directly, so no pysam dependency.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.idx = {}
+        with open(path + ".fai") as fh:
+            for line in fh:
+                c = line.rstrip("\n").split("\t")
+                # name -> (length, offset, bases_per_line, bytes_per_line)
+                self.idx[c[0]] = (int(c[1]), int(c[2]), int(c[3]), int(c[4]))
+        self.fh = open(path, "rb")
+        self.cur = None
+        self.seq = None
+
+    def _load(self, chrom):
+        meta = self.idx.get(chrom)
+        self.cur = chrom
+        if meta is None:
+            self.seq = None
+            return
+        length, offset, lb, lw = meta
+        nlines = (length + lb - 1) // lb
+        self.fh.seek(offset)
+        raw = self.fh.read(nlines * lw)
+        self.seq = raw.replace(b"\n", b"").replace(b"\r", b"")[:length].upper()
+
+    def get(self, chrom, start0, length):
+        """0-based half-open slice as str, or None if out of range/unknown."""
+        if chrom != self.cur:
+            self._load(chrom)
+        if self.seq is None or start0 < 0 or length <= 0:
+            return None
+        if start0 + length > len(self.seq):
+            return None
+        return self.seq[start0:start0 + length].decode("ascii")
+
+
+MAX_SHIFT = 500          # repeats longer than this are not worth chasing
+
+
+def left_align(chrom, pos, ref, alt, ref_get):
+    """Left-align one indel to match `bcftools norm -f` (the vt algorithm).
+
+    pos is 1-based; returns (pos, ref, alt). Right-trim shared trailing bases,
+    then roll left only while both alleles still end in the same base, prepending
+    the reference base at pos-1. Substitutions/MNPs and anything without
+    reference context are returned unchanged, which keeps the caller fail-closed.
+
+    Validated against bcftools norm on real chr20 indels (see
+    validate_norm_vs_bcftools.sh): must agree exactly.
+    """
+    if len(ref) == len(alt):
+        return pos, ref, alt
+    # right-trim shared trailing bases, keeping at least one base per allele
+    while len(ref) > 1 and len(alt) > 1 and ref[-1] == alt[-1]:
+        ref, alt = ref[:-1], alt[:-1]
+    # roll left while both alleles end in the same base
+    shifts = 0
+    while ref[-1] == alt[-1] and pos > 1 and shifts < MAX_SHIFT:
+        b = ref_get(chrom, pos - 2, 1)        # base just left of pos, 0-based
+        if not b or b not in "ACGT":
+            break
+        ref = b + ref[:-1]
+        alt = b + alt[:-1]
+        pos -= 1
+        shifts += 1
+    return pos, ref, alt
+
+
 def open_maybe_gz(path, mode="rt"):
     return gzip.open(path, mode) if path.endswith(".gz") else open(path, mode)
 
@@ -326,10 +401,22 @@ def route(cls, fields, variants, forcemp, allowed, bl, args):
     if forcemp:
         return True                    # soft clip / unanchorable indel
 
+    rg = getattr(args, "_ref", None)
     for pos, ref, alt in (variants or []):
         if alt == "N":
             continue                                  # no-call: no genotype
-        if _fnv(chrom, pos, ref, alt) in allowed:
+        p, r, a = pos, ref, alt
+        if rg is not None and len(ref) != len(alt):
+            # Canonicalize before the membership test so the read's indel is
+            # compared in the spelling the catalogue uses. Deliberately a
+            # REPLACEMENT, not a fallback: testing the as-placed form first
+            # would still let a rare indel whose placement collides with a
+            # common one clear into LP, which is the leak this closes.
+            p, r, a = left_align(chrom, int(pos), ref, alt, rg.get)
+            if args.norm_audit is not None and (p, r, a) != (int(pos), ref, alt):
+                args.norm_audit.write("%s\t%s\t%s>%s\t%s\t%s>%s\n"
+                                      % (chrom, pos, ref, alt, p, r, a))
+        if _fnv(chrom, p, r, a) in allowed:
             continue                                  # common, or a known error
         if in_blacklist(bl, chrom, int(pos)):
             continue                                  # unmappable region
@@ -372,12 +459,33 @@ def main():
                     help="reads below this MAPQ do not force MP (0 = off)")
     rt.add_argument("--primary-chroms-only", action="store_true",
                     help="reads off chr1-22,X,Y do not force MP")
+    rt.add_argument("--reference", default=None,
+                    help="indexed FASTA (.fai beside it). Enables indel "
+                         "left-alignment before the allowed-list test, so a "
+                         "read's indel is compared in the same spelling the "
+                         "catalogue uses. Without it, indels are tested exactly "
+                         "as the aligner placed them.")
+    rt.add_argument("--norm-audit", default=None, metavar="FILE",
+                    help="log every indel whose spelling changed under "
+                         "left-alignment: chrom, as-placed, normalized")
 
     out = ap.add_argument_group("output")
     out.add_argument("--out-prefix", required=True,
                      help="writes <prefix>.LP.diff and <prefix>.MP.diff")
     out.add_argument("--gzip", action="store_true")
     args = ap.parse_args()
+
+    if args.reference:
+        if not os.path.exists(args.reference + ".fai"):
+            sys.stderr.write("ERROR: no .fai beside %s (run samtools faidx)\n"
+                             % args.reference)
+            return 1
+        args._ref = RefFasta(args.reference)
+        sys.stderr.write("indel normalization: ON (%s)\n" % args.reference)
+    else:
+        args._ref = None
+        sys.stderr.write("indel normalization: off (no --reference)\n")
+    args.norm_audit = open(args.norm_audit, "w") if args.norm_audit else None
 
     if args.allowed or args.errset:
         sys.stderr.write("loading membership set...\n")
@@ -443,6 +551,9 @@ def main():
     if proc is not None:
         proc.stdout.close()
         proc.wait()
+
+    if args.norm_audit is not None:
+        args.norm_audit.close()
 
     sys.stderr.write(
         "done.\n"
