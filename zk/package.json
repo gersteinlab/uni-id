@@ -1,0 +1,11 @@
+{
+  "name": "uni-id-zk",
+  "version": "1.0.0",
+  "description": "Zero-knowledge membership and exhaustiveness proofs for the uni-id LP layer",
+  "license": "MIT",
+  "dependencies": {
+    "circomlibjs": "^0.1.7",
+    "circomlib": "^2.0.5",
+    "snarkjs": "^0.7.6"
+  }
+}
